@@ -24,7 +24,7 @@ class Program
             31, 5
         );
 
-        // 3) 形态学滤波：开运算去小噪声 + 轻微闭运算补断裂（可选）
+        // 3) 形态学滤波：开运算去小噪声 + 轻微闭运算补断裂
         Mat k3 = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 3));
         Cv2.MorphologyEx(binary, binary, MorphTypes.Open, k3, iterations: 1);
 
@@ -42,11 +42,13 @@ class Program
         // 6) 筛选 + 中心点
         var centers = new List<Point2f>();
 
-        // 你可以根据实际图卡尺寸调这些阈值
-        const double minArea = 400;      // 过滤小噪声
-        const double maxArea = 20000;    // 过滤过大区域
-        const double minAspect = 0.50;   // 允许透视畸变更大一点
-        const double maxAspect = 1.70;
+        // 进一步优化过滤条件：
+        const double minArea = 800;      // 过滤小噪声（原来偏小，改为800）
+        const double maxArea = 20000;    // 过滤过大区域（视你的黑块大小调整）
+        const double minAspect = 0.80;   // 宽高比限制，允许透视畸变
+        const double maxAspect = 1.50;   // 控制宽高比，接近正方形的区域
+        const double minWidth = 50;      // 最小宽度，避免细长的噪声
+        const double minHeight = 50;     // 最小高度，避免细长的噪声
 
         foreach (var contour in contours)
         {
@@ -60,48 +62,34 @@ class Program
             // 只考虑凸形（排除奇怪噪声）
             if (!Cv2.IsContourConvex(approx)) continue;
 
-            // 允许 4~6 个点（透视/锯齿可能导致不是严格4点）
-            if (approx.Length < 4 || approx.Length > 6) continue;
+            if (approx.Length == 4) // 只考虑四边形
+            {
+                // 6.2) 获取矩形的外接框
+                Rect br = Cv2.BoundingRect(approx);
+                double width = br.Width;
+                double height = br.Height;
 
-            // 6.2) 旋转矩形（对斜边更稳）
-            RotatedRect rr = Cv2.MinAreaRect(contour);
-            double w = rr.Size.Width;
-            double h = rr.Size.Height;
-            if (w < 1 || h < 1) continue;
+                // 6.3) 过滤过窄或过细的区域
+                if (width < minWidth || height < minHeight) continue;
 
-            double aspect = w > h ? (w / h) : (h / w);
-            if (aspect < 1.0) aspect = 1.0 / aspect; // 保险
-            if (aspect < 1.0) aspect = 1.0;          // 保险
+                // 6.4) 计算长宽比，过滤掉不符合要求的区域
+                double aspectRatio = width / height;
+                if (aspectRatio > 1.5 || aspectRatio < 0.67) continue; // 长宽比大于1.5或小于0.67的区域视为噪声
 
-            // 这里用“接近正方形/菱形”的宽高比范围
-            if (aspect < minAspect || aspect > maxAspect) continue;
+                // 绘制四边形的外接矩形
+                Cv2.Rectangle(result, br, new Scalar(0, 255, 0), 2); // 框选矩形
 
-            // 6.3) 填充度/矩形度（抑制噪声）
-            // extent = area / (boundingRect面积)；太小说明很细碎
-            Rect br = Cv2.BoundingRect(contour);
-            double extent = area / (br.Width * br.Height + 1e-6);
-            if (extent < 0.35) continue;
+                // 6.5) 中心点（Moments）
+                Moments m = Cv2.Moments(contour);
+                if (Math.Abs(m.M00) < 1e-6) continue;
 
-            // solidity = area / convexHullArea；太小说明轮廓很凹/噪
-            Point[] hull = Cv2.ConvexHull(contour);
-            double hullArea = Cv2.ContourArea(hull);
-            double solidity = area / (hullArea + 1e-6);
-            if (solidity < 0.85) continue;
+                Point2f center = new Point2f((float)(m.M10 / m.M00), (float)(m.M01 / m.M00));
+                centers.Add(center);
 
-            // 6.4) 中心点（Moments）
-            Moments m = Cv2.Moments(contour);
-            if (Math.Abs(m.M00) < 1e-6) continue;
-
-            Point2f center = new Point2f((float)(m.M10 / m.M00), (float)(m.M01 / m.M00));
-            centers.Add(center);
-
-            // 可视化：只画中心点（如果你不想画矩形边框就不要画）
-            Cv2.Circle(result, (Point)center, 6, Scalar.Red, -1);
-            Cv2.PutText(
-                result, $"({center.X:F0},{center.Y:F0})",
-                new Point((int)center.X + 8, (int)center.Y - 8),
-                HersheyFonts.HersheySimplex, 0.6, Scalar.Red, 2
-            );
+                // 可视化：只画中心点
+                Cv2.Circle(result, (Point)center, 6, Scalar.Red, -1);
+                Cv2.PutText(result, $"({center.X:F0},{center.Y:F0})", new Point((int)center.X + 8, (int)center.Y - 8), HersheyFonts.HersheySimplex, 0.6, Scalar.Red, 2);
+            }
         }
 
         // 7) 打印中心点
@@ -117,11 +105,8 @@ class Program
         Console.WriteLine($"已保存: {outPath}");
 
         // 9) 关键：用可缩放窗口显示“全图”
-        // 你看到“四分之一”的根因通常就在这里
         Cv2.NamedWindow("检测结果", WindowFlags.Normal);   // 可缩放
         Cv2.ImShow("检测结果", result);
-
-        // 如果窗口太大，看不全：强制把窗口调小（不改变图像本身）
         Cv2.ResizeWindow("检测结果", 1200, 900);
 
         Cv2.WaitKey(0);
